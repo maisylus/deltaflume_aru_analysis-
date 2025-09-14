@@ -1,0 +1,246 @@
+unction EXCEED_COUNT_BAR_AND_TABLE(csvPath, writeLatex, mode)
+% EXCEED_COUNT_BAR_AND_TABLE
+% Builds a grouped bar chart and a compact table for counts of peaks >= R2,
+% comparing S0 vs S3 for each (H, C) pair. Saves both PNG and FIG.
+%
+% INPUTS (all optional)
+%   csvPath    : path to peak-level CSV. Default:
+%                results_runup/tables/PAPER_TABLE_R2_PEAKS.csv
+%   writeLatex : true/false to also save a LaTeX table (default: true)
+%   mode       : 'counts' (default) or 'percent'
+%                - 'counts'  -> grouped bars show S0 vs S3 counts for each H
+%                - 'percent' -> bars show % change = 100*(S3-S0)/S0 per H
+%
+% OUTPUTS
+%   plots/FIG_EXCEED_COUNT_BAR.(png|fig)
+%   tables/EXCEED_COUNT_SUMMARY.csv
+%   tables/EXCEED_COUNT_SUMMARY.tex  (if writeLatex==true)
+
+% ---------- defaults ----------
+if nargin < 1 || isempty(csvPath)
+    csvPath = fullfile('results_runup','tables','PAPER_TABLE_R2_PEAKS.csv');
+end
+if nargin < 2 || isempty(writeLatex)
+    writeLatex = true;
+end
+if nargin < 3 || isempty(mode)
+    mode = 'counts'; % or 'percent'
+end
+mode = validatestring(lower(mode), {'counts','percent'}, mfilename, 'mode');
+
+if ~isfile(csvPath), error('CSV not found: %s', csvPath); end
+
+% ---------- read table (robust to header variants) ----------
+try
+    T = readtable(csvPath,'VariableNamingRule','preserve');
+catch
+    T = readtable(csvPath);
+end
+
+Scenario = string(getcol(T, {'Scenario','scenario'}));
+H        = string(toStrCol(getcol(T, {'Water Level (cm)','WaterLevelcm','Water_Level_cm_','WaterLevel','H','h'})));
+C        = string(toStrCol(getcol(T, {'Wave Condition','WaveCondition','Wave_Condition','C','Condition','Cond'})));
+Exceeded = getcol(T, {'Exceeded','exceeded','GE_R2','ge_r2','AboveR2','above_r2'});
+
+if isempty(Scenario) || isempty(H) || isempty(C) || isempty(Exceeded)
+    disp('Available column names:'); disp(string(T.Properties.VariableNames)');
+    error('Missing one or more required columns: Scenario, Water Level, Wave Condition, Exceeded');
+end
+
+% normalize Exceeded to numeric 0/1
+if iscell(Exceeded)
+    Exceeded = double( strcmpi(string(Exceeded),'1') | strcmpi(string(Exceeded),'true') | strcmpi(string(Exceeded),'yes') );
+elseif islogical(Exceeded)
+    Exceeded = double(Exceeded);
+else
+    Exceeded = double(Exceeded);
+end
+
+ok = Scenario~="" & ~isnan(Exceeded);
+Scenario = Scenario(ok); H = H(ok); C = C(ok); Exceeded = Exceeded(ok);
+
+% ---------- aggregate counts per (Scenario,H,C) ----------
+[grp,~,idx] = unique(table(Scenario,H,C),'rows','stable');
+cnt = accumarray(idx, Exceeded, [], @nansum);
+G = grp; G.Count_GE_R2 = cnt;
+
+S0 = G(G.Scenario=="S0",:);
+S3 = G(G.Scenario=="S3",:);
+
+Pairs = innerjoin(S0(:,{'H','C','Count_GE_R2'}), S3(:,{'H','C','Count_GE_R2'}), ...
+    'Keys',{'H','C'}, 'RightVariables','Count_GE_R2');
+Pairs.Properties.VariableNames(end-1:end) = {'S0_count','S3_count'};
+
+% Sort by water level then numeric C
+Cnum = str2double(Pairs.C); Cnum(isnan(Cnum)) = inf;
+[~,ord] = sortrows([str2double(Pairs.H), Cnum]);
+Pairs = Pairs(ord,:);
+
+% Percent change (handle S0=0 safely)
+Pairs.dCount    = Pairs.S3_count - Pairs.S0_count;
+Pairs.dCountPct = nan(height(Pairs),1);
+nz = Pairs.S0_count ~= 0;
+Pairs.dCountPct(nz) = 100 * Pairs.dCount(nz) ./ Pairs.S0_count(nz);
+Pairs.dCountPct(~nz & Pairs.S3_count==0) = 0;   % 0 -> 0
+Pairs.dCountPct(~nz & Pairs.S3_count>0)  = Inf; % from 0 to >0
+
+% ---------- save numeric table ----------
+tableDir = fullfile('results_runup','tables'); if ~exist(tableDir,'dir'), mkdir(tableDir); end
+Tout = Pairs(:, {'H','C','S0_count','S3_count','dCount','dCountPct'});
+writetable(Tout, fullfile(tableDir,'EXCEED_COUNT_SUMMARY.csv'));
+
+% optional LaTeX
+if writeLatex
+    texPath = fullfile(tableDir,'EXCEED_COUNT_SUMMARY.tex');
+    fid = fopen(texPath,'w');
+    fprintf(fid,'\\begin{tabular}{llrrrr}\n\\hline\n');
+    fprintf(fid,'H & C & S0 count & S3 count & $\\Delta$count & $\\Delta$count (\\%%)\\\\\n\\hline\n');
+    for i=1:height(Tout)
+        pctStr = sprintf('%.0f', Tout.dCountPct(i));
+        if ~isfinite(Tout.dCountPct(i)), pctStr = '$\\infty$'; end
+        fprintf(fid,'H%s & C%s & %d & %d & %+d & %s\\\\\n', ...
+            Tout.H{i}, Tout.C{i}, Tout.S0_count(i), Tout.S3_count(i), Tout.dCount(i), pctStr);
+    end
+    fprintf(fid,'\\hline\n\\end{tabular}\n');
+    fclose(fid);
+end
+
+% ---------- grouped bar plot ----------
+plotDir = fullfile('results_runup','plots'); if ~exist(plotDir,'dir'), mkdir(plotDir); end
+conds = unique(Tout.C,'stable');
+Hvals = unique(Tout.H,'stable');
+
+colS0 = [0.10 0.35 0.85]; % blue
+colS3 = [0.85 0.20 0.20]; % red
+
+switch mode
+    case 'counts'
+        % M: rows = conditions, cols = [S0_H1, S3_H1, S0_H2, S3_H2, ...]
+        M = nan(numel(conds), 2*numel(Hvals));
+        leg = strings(1, 2*numel(Hvals));
+        for j=1:numel(Hvals)
+            Hj = Hvals(j);
+            leg(2*j-1) = "S0 (H"+Hj+")";
+            leg(2*j)   = "S3 (H"+Hj+")";
+            for i=1:numel(conds)
+                Ci = conds(i);
+                row = Pairs.H==Hj & Pairs.C==Ci;
+                if any(row)
+                    M(i,2*j-1) = Pairs.S0_count(row);
+                    M(i,2*j)   = Pairs.S3_count(row);
+                end
+            end
+        end
+
+        f = figure('Visible','off','Position',[200 200 1200 600]); hold on; grid on
+        hb = bar(M, 'grouped');
+        for k=1:size(M,2)
+            hb(k).EdgeColor = 'none';
+            hb(k).FaceColor = colS0;
+            if mod(k,2)==0, hb(k).FaceColor = colS3; end
+        end
+        set(gca,'XTick',1:numel(conds),'XTickLabel',"C"+conds);
+        xlabel('Wave condition'); ylabel('Count of peaks \geq R2');
+        legend(leg,'Location','bestoutside');
+
+        % annotate
+        [ng, nb] = size(M); groupWidth = min(0.8, nb/(nb+1.5));
+        for i=1:ng
+            for j=1:nb
+                if ~isnan(M(i,j))
+                    x = i - groupWidth/2 + (2*j-1) * (groupWidth/(2*nb));
+                    text(x, M(i,j), sprintf('%g', M(i,j)), ...
+                        'HorizontalAlignment','center','VerticalAlignment','bottom','FontSize',9);
+                end
+            end
+        end
+
+        outPNG = fullfile(plotDir,'FIG_EXCEED_COUNT_BAR.png');
+        outFIG = fullfile(plotDir,'FIG_EXCEED_COUNT_BAR.fig');
+
+    case 'percent'
+        % M: rows = conditions, cols = H levels (each cell is % change)
+        M = nan(numel(conds), numel(Hvals));
+        for i=1:numel(conds)
+            for j=1:numel(Hvals)
+                m = Tout.C==conds(i) & Tout.H==Hvals(j);
+                if any(m), M(i,j) = Tout.dCountPct(m); end
+            end
+        end
+
+        f = figure('Visible','off','Position',[200 200 1200 600]); hold on; grid on
+        hb = bar(M, 'grouped'); % one bar per H for each C
+        % colors per H
+        if numel(Hvals)>=1, hb(1).FaceColor = colS0; end
+        if numel(Hvals)>=2, hb(2).FaceColor = colS3; end
+        for k=3:numel(hb) % if more H values, assign random pastel
+            hb(k).FaceColor = 0.5*rand(1,3)+0.25;
+        end
+        set(gca,'XTick',1:numel(conds),'XTickLabel',"C"+conds);
+        xlabel('Wave condition'); ylabel('\Delta count (%%) = 100\cdot(S3-S0)/S0');
+        legend("H"+Hvals,'Location','bestoutside');
+
+        % annotate
+        [ng, nb] = size(M); groupWidth = min(0.8, nb/(nb+1.5));
+        for i=1:ng
+            for j=1:nb
+                if ~isnan(M(i,j))
+                    x = i - groupWidth/2 + (2*j-1) * (groupWidth/(2*nb));
+                    if isfinite(M(i,j))
+                        txt = sprintf('%.0f%%', M(i,j));
+                    else
+                        txt = '∞';
+                    end
+                    text(x, M(i,j), txt, ...
+                        'HorizontalAlignment','center','VerticalAlignment','bottom','FontSize',9);
+                end
+            end
+        end
+
+        outPNG = fullfile(plotDir,'FIG_EXCEED_COUNT_BAR_PERCENT.png');
+        outFIG = fullfile(plotDir,'FIG_EXCEED_COUNT_BAR_PERCENT.fig');
+end
+
+saveas(f, outPNG);
+savefig(f, outFIG);
+close(f);
+
+% ---------- summary message ----------
+if writeLatex
+    latexMsg = fullfile(tableDir,'EXCEED_COUNT_SUMMARY.tex');
+else
+    latexMsg = '(LaTeX skipped)';
+end
+fprintf('Saved:\n  %s\n  %s\n  %s\n', ...
+    [outPNG ' & ' outFIG], ...
+    fullfile(tableDir,'EXCEED_COUNT_SUMMARY.csv'), ...
+    latexMsg);
+end % ===== end main =====
+
+
+% ===== helpers =====
+function col = getcol(T,names)
+vn = string(T.Properties.VariableNames); col = [];
+for i=1:numel(names)
+    j = find(vn == string(names{i}), 1, 'first');
+    if ~isempty(j), col = T{:,j}; return; end
+end
+end
+
+function s = toStrCol(col)
+if iscell(col)
+    s = strings(numel(col),1);
+    for i=1:numel(col)
+        x = col{i};
+        if isstring(x), s(i)=x(1);
+        elseif ischar(x), s(i)=string(x);
+        elseif isnumeric(x), s(i)=string(num2str(x));
+        else, s(i)="";
+        end
+    end
+elseif isstring(col), s = col;
+elseif ischar(col),  s = string(col);
+elseif isnumeric(col), s = string(col);
+else, s = string(col);
+end
+end
