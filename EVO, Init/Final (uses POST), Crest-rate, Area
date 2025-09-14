@@ -1,0 +1,444 @@
+%% run_morphology.m — EVO, Init/Final (uses POST), Crest-rate, Area
+% Uses only comparable pairs: H533_C7, H533_C9, H550_C3, H550_C7
+% Crops x to [162 185] m to avoid back-island channel influence
+clear; clc; close all;
+
+%% -------------------- Paths --------------------
+rootDir = fileparts(mfilename('fullpath'));
+dirS0   = fullfile(rootDir, 'MOR_S0'); if exist(fullfile(dirS0,'MOR_S0'),'dir'), dirS0 = fullfile(dirS0,'MOR_S0'); end
+dirS3   = fullfile(rootDir, 'MOR_S3'); if exist(fullfile(dirS3,'MOR_S3'),'dir'), dirS3 = fullfile(dirS3,'MOR_S3'); end
+
+outDir = fullfile(rootDir, 'Output');
+figDir = fullfile(outDir, 'Figures');
+tabDir = fullfile(outDir, 'Tables');
+if ~exist(figDir,'dir'), mkdir(figDir); end
+if ~exist(tabDir,'dir'), mkdir(tabDir); end
+
+%% -------------------- Config --------------------
+ALLOW_KEYS   = string({'H533_C7','H533_C9','H550_C3','H550_C7'}); % confirmed pairs
+Hmap         = containers.Map({'H533','H550'}, [5.33, 5.50]);    % SWL (m)
+xCrop        = [162 185];     % focus on island face
+smoothN      = 5;             % movmean window (odd). set 1 to disable smoothing
+nEvoLines    = 6;             % # snapshots to show in F1
+Tdrop_cm     = 5;             % T5cm threshold for crest (cm)
+
+%% -------------------- Optional: POST profile CSVs (high-res finals) --------------------
+postS0_file = ''; postS3_file = '';
+dS0post = dir(fullfile(dirS0,'**','*MOR_S0*POST*PROFILES*.csv'));
+if isempty(dS0post), dS0post = dir(fullfile(dirS0,'**','*MOR_S0*PROFILES*.csv')); end
+if ~isempty(dS0post), postS0_file = fullfile(dS0post(1).folder, dS0post(1).name); end
+
+dS3post = dir(fullfile(dirS3,'**','*MOR_S3*POST*PROFILES*.csv'));
+if isempty(dS3post), dS3post = dir(fullfile(dirS3,'**','*MOR_S3*PROFILES*.csv')); end
+if ~isempty(dS3post), postS3_file = fullfile(dS3post(1).folder, dS3post(1).name); end
+
+PostS0 = struct(); PostS3 = struct();
+if ~isempty(postS0_file), PostS0 = load_post_profiles(postS0_file); end
+if ~isempty(postS3_file), PostS3 = load_post_profiles(postS3_file); end
+
+%% -------------------- Find & pair 5-minute files --------------------
+filesS0 = dir(fullfile(dirS0, '**', '5min_Profile_MOR_S0_H*_C*.csv'));
+filesS3 = dir(fullfile(dirS3, '**', '5min_Profile_MOR_S3_H*_C*.csv'));
+parseHC = @(nm) regexp(nm, 'H(\d{3})_C(\d+)', 'tokens', 'once');
+
+mapS0 = containers.Map;
+for k=1:numel(filesS0)
+    t = parseHC(filesS0(k).name); if isempty(t), continue; end
+    key = sprintf('H%s_C%s', t{1}, t{2});
+    if any(ALLOW_KEYS == key), mapS0(key) = fullfile(filesS0(k).folder, filesS0(k).name); end
+end
+
+pairs = struct('H',{},'C',{},'key',{},'SWL',{},'fS0',{},'fS3',{});
+p=0;
+for k=1:numel(filesS3)
+    t = parseHC(filesS3(k).name); if isempty(t), continue; end
+    key = sprintf('H%s_C%s', t{1}, t{2});
+    if ~any(ALLOW_KEYS == key), continue; end
+    if isKey(mapS0,key)
+        p=p+1; Hstr=['H' t{1}];
+        pairs(p).H   = Hstr;
+        pairs(p).C   = ['C' t{2}];
+        pairs(p).key = key;
+        pairs(p).SWL = isKey(Hmap,Hstr) * Hmap(Hstr) + ~isKey(Hmap,Hstr) * (str2double(t{1})/100);
+        pairs(p).fS0 = mapS0(key);
+        pairs(p).fS3 = fullfile(filesS3(k).folder, filesS3(k).name);
+    end
+end
+if isempty(pairs), error('No S0/S3 pairs found among: %s', strjoin(ALLOW_KEYS, ', ')); end
+
+% Friendly check
+needKeys  = ALLOW_KEYS; havePairs = string({pairs.key});
+missing   = setdiff(needKeys, havePairs, 'stable');
+if ~isempty(missing), fprintf('\n⚠️ Missing S0/S3 pairs for: %s\n\n', strjoin(missing, ', ')); end
+
+%% -------------------- Group by water level --------------------
+Hvals = unique({pairs.H}, 'stable');
+byH = struct;
+for iH=1:numel(Hvals)
+    H = Hvals{iH}; Cs={};
+    for i=1:numel(pairs), if strcmp(pairs(i).H,H), Cs{end+1}=pairs(i).C; end; end %#ok<AGROW>
+    allowedCs = cellstr(extractAfter(ALLOW_KEYS(ALLOW_KEYS.startsWith(H+"_")), "_"));
+    byH(iH).H = H;
+    byH(iH).C = intersect(unique(Cs,'stable'), allowedCs, 'stable');
+end
+
+%% -------------------- Load, crop, smooth, crest cache --------------------
+% Data(iH).H; Data(iH).Cases(j): .C .key .SWL .S0 .S3 .crest0 .crest3 [optional .S0_post .S3_post]
+Data = struct;
+for iH=1:numel(byH)
+    H = byH(iH).H; Data(iH).H = H; Data(iH).Cases = struct([]);
+    for j=1:numel(byH(iH).C)
+        C = byH(iH).C{j}; key=[H '_' C];
+        idx = find(strcmp({pairs.key}, key),1); if isempty(idx), continue; end
+        SWL = pairs(idx).SWL;
+
+        S0 = crop_x_window(smooth_along_x(load_row1x_col1t(pairs(idx).fS0), smoothN), xCrop);
+        S3 = crop_x_window(smooth_along_x(load_row1x_col1t(pairs(idx).fS3), smoothN), xCrop);
+
+        crest0 = nan(numel(S0.z),1);
+        for ii=1:numel(S0.z), [~, zt, ok]=safe_profile(S0,ii); if ok, crest0(ii)=max(zt); end; end
+        crest3 = nan(numel(S3.z),1);
+        for ii=1:numel(S3.z), [~, zt, ok]=safe_profile(S3,ii); if ok, crest3(ii)=max(zt); end; end
+
+        kCase = numel(Data(iH).Cases)+1;
+        Data(iH).Cases(kCase).C = C;
+        Data(iH).Cases(kCase).key = key;
+        Data(iH).Cases(kCase).SWL = SWL;
+        Data(iH).Cases(kCase).S0 = S0;
+        Data(iH).Cases(kCase).S3 = S3;
+        Data(iH).Cases(kCase).crest0 = crest0;
+        Data(iH).Cases(kCase).crest3 = crest3;
+
+        % Attach high-res POST profiles (cropped) if available
+        if isfield(PostS0,key)
+            [xx,zz] = crop_to_window(PostS0.(key).x, PostS0.(key).z, xCrop);
+            Data(iH).Cases(kCase).S0_post.x = xx; Data(iH).Cases(kCase).S0_post.z = zz;
+        end
+        if isfield(PostS3,key)
+            [xx,zz] = crop_to_window(PostS3.(key).x, PostS3.(key).z, xCrop);
+            Data(iH).Cases(kCase).S3_post.x = xx; Data(iH).Cases(kCase).S3_post.z = zz;
+        end
+    end
+end
+
+tileH = numel(Data);
+tileW = max(arrayfun(@(s) numel(s.Cases), Data));
+
+%% ==================== FIGURE 1: EVO profiles (S0 solid, S3 dashed) ====================
+f1 = figure('Color','w','Position',[100 100 1400 850]);
+tlo = tiledlayout(tileH,tileW,'Padding','compact','TileSpacing','compact');
+for iH=1:tileH
+    for j=1:tileW
+        nexttile; if j>numel(Data(iH).Cases), axis off; continue; end
+        C=Data(iH).Cases(j).C; SWL=Data(iH).Cases(j).SWL; S0=Data(iH).Cases(j).S0; S3=Data(iH).Cases(j).S3;
+
+        nSteps=min(numel(S0.z),numel(S3.z)); if nSteps<1, axis off; continue; end
+        idx = unique(round(linspace(1,nSteps,min(nEvoLines,nSteps))));
+
+        hold on; grid on; cmap=lines(numel(idx));
+        for ii=1:numel(idx)
+            [x0,z0,o0]=safe_profile(S0,idx(ii)); [x3,z3,o3]=safe_profile(S3,idx(ii));
+            if o0, plot(double(x0),double(z0),'-','LineWidth',1.4,'Color',cmap(ii,:)); end
+            if o3, plot(double(x3),double(z3),'--','LineWidth',1.4,'Color',cmap(ii,:)); end
+        end
+        hSWL=yline(SWL,'k--','SWL'); set(hSWL,'DisplayName','SWL');
+        xlim(xCrop); axis tight; xlabel('x (m)'); ylabel('z (m)');
+        title(sprintf('%s-%s',Data(iH).H,C));
+
+        h1=plot(nan,nan,'k-','LineWidth',1.4,'DisplayName','S0');
+        h2=plot(nan,nan,'k--','LineWidth',1.4,'DisplayName','S3');
+        legend([h1 h2 hSWL],'Location','southoutside','Orientation','horizontal');
+    end
+end
+title(tlo,'F1 — EVO profiles (S0 solid, S3 dashed) — comparable runs only');
+savefig(f1,fullfile(figDir,'F1_EVO.fig')); saveas(f1,fullfile(figDir,'F1_EVO.png')); close(f1);
+
+%% ==================== FIGURE 2: Initial vs Final overlays (prefer POST finals) ====================
+f2=figure('Color','w','Position',[100 100 1400 850]);
+tlo=tiledlayout(tileH,tileW,'Padding','compact','TileSpacing','compact');
+
+for iH=1:tileH
+    for j=1:tileW
+        nexttile; if j>numel(Data(iH).Cases), axis off; continue; end
+        D   = Data(iH).Cases(j);
+        C   = D.C; SWL = D.SWL; S0 = D.S0; S3 = D.S3;
+
+        % Finals: last valid profile (walk back if needed)
+        iFinal0 = numel(S0.z); [x0f,z0f,o0f] = safe_profile(S0, iFinal0);
+        while ~o0f && iFinal0 > 1, iFinal0 = iFinal0 - 1; [x0f,z0f,o0f] = safe_profile(S0, iFinal0); end
+        iFinal3 = numel(S3.z); [x3f,z3f,o3f] = safe_profile(S3, iFinal3);
+        while ~o3f && iFinal3 > 1, iFinal3 = iFinal3 - 1; [x3f,z3f,o3f] = safe_profile(S3, iFinal3); end
+
+        % Initials: first valid profile (walk forward if needed)
+        iInit0 = 1; [x0i,z0i,o0i] = safe_profile(S0, iInit0);
+        k = 1; while ~o0i && k <= numel(S0.z), [x0i,z0i,o0i] = safe_profile(S0, k); k=k+1; end
+        iInit3 = 1; [x3i,z3i,o3i] = safe_profile(S3, iInit3);
+        k = 1; while ~o3i && k <= numel(S3.z), [x3i,z3i,o3i] = safe_profile(S3, k); k=k+1; end
+
+        % Prefer high-res POST profiles as finals if present
+        if isfield(D,'S0_post') && ~isempty(D.S0_post)
+            x0f = double(D.S0_post.x); z0f = double(D.S0_post.z); o0f = ~isempty(x0f);
+        end
+        if isfield(D,'S3_post') && ~isempty(D.S3_post)
+            x3f = double(D.S3_post.x); z3f = double(D.S3_post.z); o3f = ~isempty(x3f);
+        end
+
+        hold on; grid on;
+        if o0i, plot(double(x0i),double(z0i),'-', 'Color',[0.2 0.2 0.8],'LineWidth',1.4,'DisplayName','S0 initial'); end
+        if o0f, plot(double(x0f),double(z0f),'-', 'Color',[0 0 0.6],'LineWidth',1.8,'DisplayName','S0 final (post/last)'); end
+        if o3i, plot(double(x3i),double(z3i),'--','Color',[0.8 0.2 0.2],'LineWidth',1.4,'DisplayName','S3 initial'); end
+        if o3f, plot(double(x3f),double(z3f),'--','Color',[0.6 0 0],  'LineWidth',1.8,'DisplayName','S3 final (post/last)'); end
+        hSWL = yline(SWL,'k--','SWL'); set(hSWL,'DisplayName','SWL');
+
+        xlim(xCrop); axis tight; xlabel('x (m)'); ylabel('z (m)');
+        title(sprintf('%s-%s',Data(iH).H,C));
+        legend('Location','southoutside','Orientation','horizontal');
+    end
+end
+title(tlo,'F2 — Initial vs Final (prefer POST finals) — comparable runs only');
+savefig(f2,fullfile(figDir,'F2_InitFinal.fig')); saveas(f2,fullfile(figDir,'F2_InitFinal.png')); close(f2);
+
+%% ==================== FIGURE 3: Crest-lowering rate (mm/min) + CSV ====================
+CondC=strings(0,1); ScenarioC=strings(0,1); HsC=strings(0,1); CsC=strings(0,1);
+Initial_m=[]; Final_m=[]; PctChange=[]; Slope_mm_min=[]; T5cm_s=[];
+for iH=1:numel(Data)
+    for j=1:numel(Data(iH).Cases)
+        S0=Data(iH).Cases(j).S0; S3=Data(iH).Cases(j).S3; key=Data(iH).Cases(j).key;
+        condH=string(Data(iH).H); condC=string(Data(iH).Cases(j).C);
+
+        % S0 metrics
+        [ini,fin,pct,rate,t5]=crest_metrics_one(S0,Data(iH).Cases(j).crest0,Tdrop_cm);
+        CondC(end+1,1)=string(key); ScenarioC(end+1,1)="S0"; HsC(end+1,1)=condH; CsC(end+1,1)=condC;
+        Initial_m(end+1,1)=ini; Final_m(end+1,1)=fin; PctChange(end+1,1)=pct; Slope_mm_min(end+1,1)=rate; T5cm_s(end+1,1)=t5;
+
+        % S3 metrics
+        [ini,fin,pct,rate,t5]=crest_metrics_one(S3,Data(iH).Cases(j).crest3,Tdrop_cm);
+        CondC(end+1,1)=string(key); ScenarioC(end+1,1)="S3"; HsC(end+1,1)=condH; CsC(end+1,1)=condC;
+        Initial_m(end+1,1)=ini; Final_m(end+1,1)=fin; PctChange(end+1,1)=pct; Slope_mm_min(end+1,1)=rate; T5cm_s(end+1,1)=t5;
+    end
+end
+
+Tcrest=table(CondC,ScenarioC,HsC,CsC,Initial_m,Final_m,PctChange,Slope_mm_min,T5cm_s, ...
+    'VariableNames',{'Condition','Scenario','H','C','InitialCrest_m','FinalCrest_m','PctChange','Rate_mm_per_min','T5cm_s'});
+writetable(Tcrest, fullfile(tabDir,'crest_metrics.csv'));
+
+% Paired slope plot (S0 vs S3)
+conds=unique(Tcrest.Condition,'stable'); x=1:numel(conds);
+rateS0=nan(size(x)); rateS3=nan(size(x));
+for k=1:numel(conds)
+    r0=Tcrest(Tcrest.Condition==conds(k)&Tcrest.Scenario=="S0",:);
+    r3=Tcrest(Tcrest.Condition==conds(k)&Tcrest.Scenario=="S3",:);
+    if ~isempty(r0), rateS0(k)=r0.Rate_mm_per_min(1); end
+    if ~isempty(r3), rateS3(k)=r3.Rate_mm_per_min(1); end
+end
+
+f3=figure('Color','w','Position',[100 100 1200 460]); hold on; grid on;
+for k=1:numel(x)
+    if isfinite(rateS0(k)) && isfinite(rateS3(k))
+        plot([x(k) x(k)], [rateS0(k) rateS3(k)], '-', 'Color', [0.85 0.85 0.85]);
+    end
+end
+plot(x, rateS0, 'bo-', 'LineWidth',1.6, 'MarkerSize',5, 'DisplayName','S0 rate');
+plot(x, rateS3, 'ro-', 'LineWidth',1.6, 'MarkerSize',5, 'DisplayName','S3 rate');
+xticks(x); xticklabels(conds); xtickangle(30); yline(0,'k-');
+ylabel('Crest-lowering rate (mm/min)'); xlabel('Condition (H###_C#)');
+title(sprintf('F3 — Crest-lowering rate (T_{%dcm} in CSV)', Tdrop_cm));
+legend('Location','best');
+savefig(f3, fullfile(figDir,'F3_CrestRate.fig'));
+saveas(f3,  fullfile(figDir,'F3_CrestRate.png'));
+close(f3);
+
+%% ==================== FIGURE 4: Cross-sectional area above SWL (x=162–185) ====================
+% For each condition (S0/S3): compute A_init, A_final, DeltaA, Pct, and reef effect
+CondA=strings(0,1); ScenarioA=strings(0,1);
+A_init=[]; A_final=[]; DeltaA=[]; Pct=[];
+
+for iH=1:numel(Data)
+    for j=1:numel(Data(iH).Cases)
+        D = Data(iH).Cases(j);
+        SWL = D.SWL;
+
+        % S0 initial & final (prefer POST for final if present)
+        [~, x0i, z0i, ok0i] = first_valid_profile(D.S0);
+        if isfield(D,'S0_post') && ~isempty(D.S0_post)
+            x0f = D.S0_post.x; z0f = D.S0_post.z; ok0f = ~isempty(x0f);
+        else
+            [~, x0f, z0f, ok0f] = last_valid_profile(D.S0);
+        end
+
+        % S3 initial & final (prefer POST for final if present)
+        [~, x3i, z3i, ok3i] = first_valid_profile(D.S3);
+        if isfield(D,'S3_post') && ~isempty(D.S3_post)
+            x3f = D.S3_post.x; z3f = D.S3_post.z; ok3f = ~isempty(x3f);
+        else
+            [~, x3f, z3f, ok3f] = last_valid_profile(D.S3);
+        end
+
+        a0i = NaN; a0f = NaN; a3i = NaN; a3f = NaN;
+        if ok0i, a0i = trapz(x0i, max(z0i - SWL, 0)); end
+        if ok0f, a0f = trapz(x0f, max(z0f - SWL, 0)); end
+        if ok3i, a3i = trapz(x3i, max(z3i - SWL, 0)); end
+        if ok3f, a3f = trapz(x3f, max(z3f - SWL, 0)); end
+
+        % Store rows
+        % S0
+        CondA(end+1,1)   = string(D.key);  ScenarioA(end+1,1) = "S0";
+        A_init(end+1,1)  = a0i; A_final(end+1,1) = a0f;
+        DeltaA(end+1,1)  = a0f - a0i; Pct(end+1,1) = 100 * (a0f - a0i) / a0i;
+        % S3
+        CondA(end+1,1)   = string(D.key);  ScenarioA(end+1,1) = "S3";
+        A_init(end+1,1)  = a3i; A_final(end+1,1) = a3f;
+        DeltaA(end+1,1)  = a3f - a3i; Pct(end+1,1) = 100 * (a3f - a3i) / a3i;
+    end
+end
+
+Tarea = table(CondA, ScenarioA, A_init, A_final, DeltaA, Pct, ...
+    'VariableNames', {'Condition','Scenario','A_init_m2','A_final_m2','DeltaA_m2','PctChange'});
+writetable(Tarea, fullfile(tabDir,'area_metrics.csv'));
+
+% Build reef-effect vector per condition: DeltaA_S3 - DeltaA_S0
+conds = unique(Tarea.Condition,'stable'); x = 1:numel(conds);
+dS0 = nan(size(x)); dS3 = nan(size(x));
+for k=1:numel(conds)
+    r0 = Tarea(Tarea.Condition==conds(k) & Tarea.Scenario=="S0", :);
+    r3 = Tarea(Tarea.Condition==conds(k) & Tarea.Scenario=="S3", :);
+    if ~isempty(r0), dS0(k) = r0.DeltaA_m2(1); end
+    if ~isempty(r3), dS3(k) = r3.DeltaA_m2(1); end
+end
+reefEff = dS3 - dS0; % positive => S3 preserved more area (less erosion)
+
+% Plot: paired DeltaA bars (S0 vs S3) and reef effect
+f4 = figure('Color','w','Position',[100 100 1200 540]);
+
+subplot(1,2,1); hold on; grid on;
+bw = 0.35;
+bar(x-bw/2, dS0, bw, 'FaceColor',[0.2 0.2 0.8], 'DisplayName','S0 ΔArea');
+bar(x+bw/2, dS3, bw, 'FaceColor',[0.8 0.2 0.2], 'DisplayName','S3 ΔArea');
+xticks(x); xticklabels(conds); xtickangle(30);
+yline(0,'k-');
+ylabel('\Delta Area above SWL (m^2 per unit width)');
+xlabel('Condition (H###_C#)');
+title('F4a — Change in cross-sectional area (final - initial)');
+legend('Location','best');
+
+subplot(1,2,2); hold on; grid on;
+bar(x, reefEff, 0.6, 'FaceColor',[0.5 0.5 0.5], 'DisplayName','S3 - S0');
+xticks(x); xticklabels(conds); xtickangle(30);
+yline(0,'k-');
+ylabel('Reef effect: \DeltaA_{S3} - \DeltaA_{S0} (m^2)');
+xlabel('Condition (H###_C#)');
+title('F4b — Reef effect (positive = less erosion with reef)');
+legend('Location','best');
+
+savefig(f4, fullfile(figDir,'F4_Area.fig'));
+saveas(f4,  fullfile(figDir,'F4_Area.png'));
+close(f4);
+
+disp('✅ Done. See Output/Figures (F1..F4) and Output/Tables/*.csv');
+
+%% ======================= Local functions (at end) =======================
+function S=load_row1x_col1t(f)
+    % CSV layout: first row x (m) in columns 2:end; first column time (s) in rows 2:end
+    M=readmatrix(f);
+    M = M(any(isfinite(M),2),:);      % drop empty rows
+    M = M(:,any(isfinite(M),1));      % drop empty cols
+    x=M(1,2:end); t=M(2:end,1); Zm=M(2:end,2:end);
+    [t,ord]=sort(t); Zm=Zm(ord,:);
+    Z=cell(1,numel(t)); for i=1:numel(t), Z{i}=Zm(i,:).'; end
+    S.x=x(:); S.tSec=t(:).'; S.z=Z;
+end
+
+function S=smooth_along_x(S,n)
+    for i=1:numel(S.z)
+        zi=S.z{i}; if any(isnan(zi)), zi=fillmissing(zi,'linear'); end
+        if n>=3 && mod(n,2)==1, S.z{i}=movmean(zi,n,'omitnan'); else, S.z{i}=zi; end
+    end
+end
+
+function S=crop_x_window(S,win)
+    if isempty(win), return; end
+    m=S.x>=win(1)&S.x<=win(2); S.x=S.x(m);
+    for i=1:numel(S.z), if ~isempty(S.z{i}), S.z{i}=S.z{i}(m); end; end
+end
+
+function [xv,zv,ok]=safe_profile(S,iT)
+    ok=false; xv=[]; zv=[];
+    if isempty(S)||iT<1||iT>numel(S.z), return; end
+    if isempty(S.x)||isempty(S.z{iT}), return; end
+    xv=double(S.x(:)); zv=double(S.z{iT}(:));
+    if numel(zv)~=numel(xv)
+        t1=linspace(0,1,max(numel(zv),2)); t2=linspace(0,1,max(numel(xv),2));
+        zv=interp1(t1,zv(:).',t2,'linear','extrap').'; zv=zv(1:numel(xv));
+    end
+    if any(~isfinite(zv)), zv=fillmissing(zv,'linear'); end
+    if numel(xv)<2||numel(zv)<2||any(~isfinite(zv)), return; end
+    ok=true;
+end
+
+function [ini,fin,pct,rate_mm_min,t5] = crest_metrics_one(S, crest, Tdrop_cm)
+    t = S.tSec(:); z = crest(:);
+    good = isfinite(t) & isfinite(z); t = t(good); z = z(good);
+    if numel(t) < 2
+        ini = NaN; fin = NaN; pct = NaN; rate_mm_min = NaN; t5 = NaN; return;
+    end
+    ini = z(1); fin = z(end); pct = 100*(fin - ini)/ini;
+    % slope (m/s) → robust if available, else OLS
+    try
+        b = robustfit(t, z); rate_mps = b(2);
+    catch
+        p = polyfit(t, z, 1); rate_mps = p(1);
+    end
+    rate_mm_min = rate_mps * 60 * 1000;
+    % Time to drop by Tdrop_cm from the initial crest
+    thr = ini - (Tdrop_cm/100);
+    t5 = NaN;
+    if any(z <= thr)
+        idx = find(z <= thr, 1, 'first');
+        if idx == 1
+            t5 = t(1);
+        else
+            t1 = t(idx-1); t2 = t(idx);
+            z1 = z(idx-1); z2 = z(idx);
+            if z2 ~= z1
+                t5 = t1 + (thr - z1) * (t2 - t1) / (z2 - z1);
+            else
+                t5 = t(idx);
+            end
+        end
+    end
+end
+
+function P = load_post_profiles(fcsv)
+% Reads a post-profile CSV into a struct of profiles keyed by 'H###_C#'
+% Expects one column = x (m); other columns = profiles with header names containing H### and C#.
+    T=readtable(fcsv,'VariableNamingRule','preserve');
+    xcol=find(strcmpi(T.Properties.VariableNames,'x'),1); if isempty(xcol), xcol=1; end
+    x=T{:,xcol}; P=struct();
+    for v=1:width(T)
+        if v==xcol, continue; end
+        name=T.Properties.VariableNames{v};
+        tok=regexp(name,'H(\d{3}).*C(\d+)','tokens','once'); if isempty(tok), continue; end
+        key=sprintf('H%s_C%s',tok{1},tok{2}); z=T{:,v};
+        m=isfinite(x)&isfinite(z); P.(key).x=double(x(m)); P.(key).z=double(z(m));
+    end
+end
+
+function [xc,zc] = crop_to_window(x,z,win)
+    m=(x>=win(1))&(x<=win(2)); xc=x(m); zc=z(m);
+end
+
+function [idx, x, z, ok] = first_valid_profile(S)
+    ok=false; x=[]; z=[]; idx=NaN;
+    for k=1:numel(S.z)
+        [xk, zk, okk] = safe_profile(S, k);
+        if okk, idx=k; x=xk; z=zk; ok=true; return; end
+    end
+end
+
+function [idx, x, z, ok] = last_valid_profile(S)
+    ok=false; x=[]; z=[]; idx=NaN;
+    for k=numel(S.z):-1:1
+        [xk, zk, okk] = safe_profile(S, k);
+        if okk, idx=k; x=xk; z=zk; ok=true; return; end
+    end
+end
