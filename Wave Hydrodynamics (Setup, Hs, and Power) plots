@@ -1,0 +1,208 @@
+function make_mean_alongX_profiles_S0vS3_bothSWLs()
+% Mean along-flume profiles (Setup, Hs, Power)
+% - S0 (solid) vs S3 (dashed)
+% - Both SWLs (5.33 blue, 5.50 red) overlaid
+% - x-range fixed to [40, 160] m
+% - Faulty sensor near x≈150 m removed and interpolated across
+% - Uses only "comparable" conditions (S0 & S3 both present at the SWL)
+%
+% CSV expected (long/tidy):
+%   profiles_along_x_long.csv  with columns:
+%   SWL, Condition, Scenario (S0/S3), Metric (Setup/Hs/P), X, Value
+%
+% Output: FIG in ./Figures
+
+clc; close all;
+
+%% -------- user settings --------
+CSV_CANDIDATES = { ...
+    fullfile(pwd,'profiles_along_x_long.csv'), ...
+    fullfile('MATLAB Drive','Wave_Energy_Results','csv','profiles_along_x_long.csv'), ...
+    fullfile('Wave_Energy_Results','csv','profiles_along_x_long.csv') ...
+};
+X_RANGE   = [40 160];
+BAD_X     = 150;          % faulty sensor center
+BAD_TOL   = 3.0;          % +/- m to remove around BAD_X
+AR13_X    = 135;          % for shading
+AR14_X    = 147;          % for shading
+SWLs      = [5.33 5.50];
+METRICS   = ["Setup","Hs","P"];
+SHOW_CI   = false;        % true => 95% CI errorbars; false => lines only
+
+col33 = [0.15 0.35 0.85];  % blue  (SWL 5.33)
+col50 = [0.85 0.30 0.25];  % red   (SWL 5.50)
+LW    = 1.8;
+MSZ   = 5;
+CAP   = 5;
+
+%% -------- locate and read CSV --------
+csvPath = '';
+for i = 1:numel(CSV_CANDIDATES)
+    if exist(CSV_CANDIDATES{i},'file')==2
+        csvPath = CSV_CANDIDATES{i};
+        break
+    end
+end
+assert(~isempty(csvPath), 'profiles_along_x_long.csv not found in expected locations.');
+
+T = readtable(csvPath);
+req = {'SWL','Condition','Scenario','Metric','X','Value'};
+assert(all(ismember(req, T.Properties.VariableNames)), ...
+    'CSV must contain: %s', strjoin(req, ', '));
+
+% normalize types
+T.Condition = string(T.Condition);
+T.Scenario  = string(T.Scenario);
+T.Metric    = string(T.Metric);
+
+% keep only metrics we plot
+T = T(ismember(T.Metric, METRICS), :);
+
+% clip x-range & remove faulty sensor window
+T = T(T.X>=X_RANGE(1) & T.X<=X_RANGE(2), :);
+T(abs(T.X - BAD_X) <= BAD_TOL, :) = [];
+
+%% -------- find comparable conditions per SWL --------
+condsAll = unique(T.Condition, 'stable');
+condsBySWL = cell(numel(SWLs),1);
+for s = 1:numel(SWLs)
+    swl = SWLs(s);
+    hasBoth = arrayfun(@(c) any(T.Condition==c & T.SWL==swl & T.Scenario=="S0") & ...
+                             any(T.Condition==c & T.SWL==swl & T.Scenario=="S3"), condsAll);
+    condsBySWL{s} = condsAll(hasBoth);
+end
+
+%% -------- build common x-grid --------
+xGrid = unique(T.X);
+xGrid = xGrid(:).';
+xGrid = xGrid(xGrid>=X_RANGE(1) & xGrid<=X_RANGE(2));
+if isempty(xGrid), error('No X data within requested range.'); end
+if abs(xGrid(end)-X_RANGE(2))>1e-6, xGrid = [xGrid, X_RANGE(2)]; end
+
+%% -------- compute means & optional CIs on x-grid --------
+S = struct();
+for s = 1:numel(SWLs)
+    swl = SWLs(s);
+    cKeep = condsBySWL{s};
+    S(s).S0 = meanProfileAlongX(T, xGrid, swl, "S0", METRICS, cKeep, SHOW_CI);
+    S(s).S3 = meanProfileAlongX(T, xGrid, swl, "S3", METRICS, cKeep, SHOW_CI);
+end
+
+%% -------- figure: 3 stacked panels --------
+outDir = fullfile(fileparts(csvPath),'Figures'); if ~exist(outDir,'dir'), mkdir(outDir); end
+f = figure('Color','w','Position',[120 80 1100 1000]);
+tlo = tiledlayout(3,1,'Padding','compact','TileSpacing','compact');
+title(tlo, 'Along-flume mean profiles (S0 solid, S3 dashed) — SWL 5.33 & 5.50');
+
+% symbol sets so S0/S3 differ; SWLs differ by color
+sty = struct('lsS0','-','lsS3','--','mkS0','o','mkS3','s');
+
+for mi = 1:numel(METRICS)
+    metric = METRICS(mi);
+    ax = nexttile; hold(ax,'on'); grid(ax,'on'); box(ax,'on');
+
+    % --- SWL 5.33 (blue)
+    plotWithCI(ax, xGrid, S(1).S0.mean(mi,:), S(1).S0.ci(mi,:), col33, sty.lsS0, sty.mkS0, LW, MSZ, CAP, SHOW_CI, 'S0 @ 5.33');
+    plotWithCI(ax, xGrid, S(1).S3.mean(mi,:), S(1).S3.ci(mi,:), col33, sty.lsS3, sty.mkS3, LW, MSZ, CAP, SHOW_CI, 'S3 @ 5.33');
+
+    % --- SWL 5.50 (red)
+    plotWithCI(ax, xGrid, S(2).S0.mean(mi,:), S(2).S0.ci(mi,:), col50, sty.lsS0, sty.mkS0, LW, MSZ, CAP, SHOW_CI, 'S0 @ 5.50');
+    plotWithCI(ax, xGrid, S(2).S3.mean(mi,:), S(2).S3.ci(mi,:), col50, sty.lsS3, sty.mkS3, LW, MSZ, CAP, SHOW_CI, 'S3 @ 5.50');
+
+    % cosmetics
+    xlim(ax, X_RANGE);
+    xlabel(ax,'x (m)'); ylabel(ax, char(metric)); title(ax, char(metric));
+
+    % shade AR13–AR14 band
+    yl = ylim(ax);
+    p = patch(ax, [AR13_X AR14_X AR14_X AR13_X], [yl(1) yl(1) yl(2) yl(2)], ...
+        [0.92 0.92 0.92], 'EdgeColor','none', 'FaceAlpha',0.5, 'HandleVisibility','off');
+    uistack(p,'bottom');
+
+    % tighten y-lims
+    yAll = [S(1).S0.mean(mi,:) S(1).S3.mean(mi,:) S(2).S0.mean(mi,:) S(2).S3.mean(mi,:)];
+    yAll = yAll(isfinite(yAll));
+    pad = 0.06*(max(yAll)-min(yAll)+eps);
+    ylim(ax, [min(yAll)-pad, max(yAll)+pad]);
+
+    if mi==1
+        lg = legend(ax, 'Location','southoutside','Orientation','horizontal');
+        lg.NumColumns = 2;
+    end
+end
+
+saveas(f, fullfile(outDir,'AlongX_MeanProfiles_S0vS3_SWL533_550_x40to160.png'));
+savefig(f, fullfile(outDir,'AlongX_MeanProfiles_S0vS3_SWL533_550_x40to160.fig'));
+fprintf('Saved: %s\n', outDir);
+
+end % main
+
+
+%% ================= helpers =================
+function S = meanProfileAlongX(T, xGrid, swl, scenario, METRICS, condsKeep, wantCI)
+% Returns S.mean (M×Nx) and S.ci (M×Nx), M = num metrics
+
+    M = numel(METRICS);
+    S.mean = nan(M, numel(xGrid));
+    S.ci   = nan(M, numel(xGrid));
+
+    % subset table
+    Q = T(T.SWL==swl & T.Scenario==scenario & ismember(T.Condition, condsKeep), :);
+    if isempty(Q), return; end
+
+    for mi = 1:M
+        metric = METRICS(mi);
+
+        sub = Q(Q.Metric==metric, {'Condition','X','Value'});
+        if isempty(sub), continue; end
+
+        % average per X across conditions (comparable set)
+        xU = unique(sub.X);
+        muPerX = nan(size(xU));
+        ciPerX = nan(size(xU));
+
+        for k = 1:numel(xU)
+            vals = sub.Value(sub.X==xU(k));
+            muPerX(k) = mean(vals, 'omitnan');
+            if wantCI
+                ciPerX(k) = ci95(vals);
+            else
+                ciPerX(k) = NaN;
+            end
+        end
+
+        % sort & consolidate duplicates
+        [xU, ord] = sort(xU);
+        muPerX = muPerX(ord);
+        ciPerX = ciPerX(ord);
+        [xUu, ia] = unique(xU, 'stable');
+        muPerX = accumarray(ia, muPerX, [], @mean);
+        ciPerX = accumarray(ia, ciPerX, [], @mean); % small smoothing of CI
+
+        % interpolate/extrapolate along xGrid
+        S.mean(mi,:) = interp1(xUu, muPerX, xGrid, 'linear', 'extrap');
+        S.ci  (mi,:) = interp1(xUu, ciPerX, xGrid, 'linear', 'extrap');
+    end
+end
+
+function plotWithCI(ax, x, mu, ci, col, ls, mk, lw, msz, cap, showCI, dispName)
+    if showCI
+        errorbar(ax, x, mu, ci, 'LineStyle', ls, 'Marker', mk, ...
+            'Color', col, 'MarkerFaceColor','w', 'LineWidth', lw, 'CapSize', cap, ...
+            'MarkerSize', msz, 'DisplayName', dispName);
+    else
+        plot(ax, x, mu, 'LineStyle', ls, 'Marker', mk, ...
+            'Color', col, 'MarkerFaceColor','w', 'LineWidth', lw, ...
+            'MarkerSize', msz, 'DisplayName', dispName);
+    end
+end
+
+function c = ci95(x)
+    x = x(isfinite(x));
+    n = numel(x);
+    if n>=2
+        c = 1.96*std(x,0)/sqrt(n);
+    else
+        c = NaN;
+    end
+end
