@@ -1,0 +1,195 @@
+% m-file READ_DELTAFLUME.M to read in Delta Flume data collected during ARISE
+
+%% clear work space and close figure windows
+clear
+close all
+
+%% constants
+rho = 1000;         % water density
+g = 9.81;
+Fs = 120;           % sampling freq Hz
+
+%% allocate coordinates to all DRO pressure sensors
+names_pressure = {'DRO01', 'DRO02', 'DRO03', 'DRO04', 'DRO05', 'DRO06', ...
+    'DRO07', 'DRO08', 'DRO09', 'DRO10', 'DRO11',  'DRO12', 'DRO13', ...
+    'DRO14', 'DRO15', 'DRO16'};
+% X position of pressure sensors
+X_pressure = [40.5 61.5 83.5 96.432 101.01 105.502 109.975 112.237 ...
+    114.676 117.57 121.056 127.547 135.032 147.035 154.539 161.05];
+% Z elevation of pressure sensors
+Z_pressure = [0 0 0 0.98 2.002 2.998 4.001 4.482  ...
+    5.002 5.008 5.003 5.002 4.988 4.989 4.992 5];
+
+%% pre-allocate outputs
+% only store 45 min long timeseries (after removing first 10 min spin-up)
+ispinup = 10*60*Fs;             % first index 
+iend = ispinup + 45*60*Fs +1;   % last index
+hc_stationary = zeros(iend-ispinup+1,length(names_pressure));
+                                % pressure head time series after correction
+eta_stationary = zeros(iend-ispinup+1,length(names_pressure)); 
+                                % surface elevation timeseries
+time_interval = ispinup:iend; 
+
+%% file names and paths 
+% path definition
+path_name = 'test_series2\16_07\M1S3H533C3\'
+% file definition
+file_name = '#M1S3H533C3.asc'
+
+%% read data
+fid = fopen([path_name file_name],'r');
+tline = fgetl(fid);
+names = textscan(tline,repmat('%s ' ,1,106));
+names = vertcat(names{[2:106]});
+fclose(fid);
+% find column numbers for instruments listed in "names_pressure"
+for i = 1:length(names_pressure) 
+  np = names_pressure{i};
+  channel_number_pressure(i) =  find(strcmp(names,np));
+end
+% read and pre-process data
+data = load([path_name file_name]);
+time = data(:,1)/1000; % time in seconds
+% pressure data
+pressure = data(:,channel_number_pressure); % in kN/m2
+pressure = pressure * 10^3;                 % in Pascal
+
+%% remove offsets and atmospheric pressure from pressure signal
+% both the pressure and airpressure have been 'zero-ed' when instruments
+% were setup. So they are relative to the atmospheric pressure 
+% at the time of installation. But there were remaining issues that are 
+% being addressed through the procedure outlined below
+%
+% extract air pressure using DRO26
+channel_air_pressure = find(strcmp(names,'DRO26'));
+airpressure = data(:,channel_air_pressure)*10^3;    % now in Pa
+airpressure = movmean(airpressure,5*Fs*60);         % 5-min moving average
+airpressure_mat = repmat(airpressure,1,length(X_pressure));
+% remove atmospheric pressure from pressure signal
+pressure = pressure - airpressure_mat;
+h = pressure/(rho*g);                               % now in meters
+Z_pressure_mat = repmat(Z_pressure,length(time),1); % z of pressure sensors
+% compute offset for 30 s pressure signal and remove this for each sensor
+irest = 30*Fs;
+ref_level = mean(data(1:irest,2));
+% offset = difference between mean pressure head and reference level 
+offset_meters = mean(pressure(1:irest,:))/(rho*g)+Z_pressure-ref_level; 
+offset_meters_mat = repmat(offset_meters,length(time),1) ;
+% corrected pressure head (after offset removal)
+hc = h-offset_meters_mat; 
+% setup defined with respect to z = 0 (flume bottom) from corrected pressure head
+setup_Pressure = mean(hc(ispinup:iend,:))+Z_pressure; 
+
+%% convert pressure to surface elevation
+% we assume that pressure sensor is installed at bed level
+hp = 0;
+maxFactor = 0.2;        % cutoff frequency for transfer function in p2sse
+for i = 1:length(X_pressure)
+  datai = hc(time_interval,i);  
+  % convert pressure to surface elevation using linear wave theory
+  [eta,depth,fcut] = p2sse(datai,1/Fs,hp,maxFactor);
+  % store detrended surface elevation timeseries for later analysis (45 min)
+  eta_stationary(:,i) = eta; 
+  % store water depth timeseries for later analysis (45 min)
+  hc_stationary(:,i) = datai; 
+end
+
+%% some plots to check offset corrections
+% time series
+p = 1;
+if p == 1,
+  figure(1)
+  subplot(211);
+    plot(time,h+Z_pressure_mat)
+    title([file_name '- without offset correction'])
+  subplot(212),plot(time,h+Z_pressure_mat-offset_meters_mat )
+    title('with offset correction')
+    legend([repmat('x=',16,1) num2str(X_pressure') repmat('m, ',16,1) vertcat(names_pressure{:})])
+    xlabel('t (s)')
+    ylabel('pressure head + elevation (m)')
+end 
+
+% mean setup
+p = 1;
+if p == 1,
+  figure(2)
+  scatter(X_pressure,setup_Pressure) % setup from pressure sensors
+  ylabel('setup + d_0 (m)')
+  xlabel('x (m)')
+  grid on
+  title(file_name)
+end
+
+% mean setup
+p = 1;
+if p == 1,
+  figure(3)
+  scatter(X_pressure,mean(hc_stationary)+Z_pressure-mean(hc_stationary(:,1))) % setup from pressure sensors
+  ylabel('setup (m)')
+  xlabel('x (m)')
+  grid on
+  title(file_name)
+end
+
+% significant wave height
+p = 1;
+if p == 1,
+  figure(4)
+  scatter(X_pressure,4*std(eta_stationary)) % Hs from pressure sensors
+  ylabel('H_s (m)')
+  xlabel('x (m)')
+  grid on
+  title(file_name)
+end
+
+%% conduct some basic analysis inside this script
+% Could be written as a function file
+for i = 1:length(names_pressure),
+  % DRO number
+  stat(1,i) = i;
+  % x-coordinate of the DRO
+  stat(2,i) = X_pressure(i);
+  % z-coordinate of the DRO
+  stat(3,i) = Z_pressure(i);
+  % mean water depth
+  stat(4,i) = mean(hc_stationary(:,i));
+  % mean water level
+  stat(5,i) = mean(hc_stationary(:,i)+Z_pressure(i));
+  % mean water level relative to offshore water level (not using DRO01)
+  stat(6,i) = mean(hc_stationary(:,i)+Z_pressure(i)) - mean(mean(hc_stationary(:,2:5)+Z_pressure(2:5)));
+  % significant wave heights
+  wl = eta_stationary(:,i);
+  wl_SS = highpass(wl,Fs,0.05);
+  wl_IG = lowpass(wl,Fs,0.05);
+  stat(7,i) = 4*std(wl);
+  stat(8,i) = 4*std(wl_SS);
+  stat(9,i) = 4*std(wl_IG);
+end
+save stat stat
+
+%% plot summary results for sinlge run
+figure(5)
+subplot(221)
+  plot(stat(2,:),stat(6,:),'ko','MarkerFacecolor','r')
+  hold
+  plot([114.5 114.5],[-0.1 0.2],'k--')
+  hold
+  axis([0 200 -0.1 0.2]); xlabel('x (m)'); ylabel('Wave setup (m)')
+subplot(222)
+  plot(stat(2,:),stat(7,:),'ko','MarkerFacecolor','b')
+  hold
+  plot([114.5 114.5],[0 1.2],'k--')
+  hold
+  axis([0 200 0 1.2]); xlabel('x (m)'); ylabel('H_s (m)')
+subplot(223)
+  plot(stat(2,:),stat(8,:),'ko','MarkerFacecolor','g')
+  hold
+  plot([114.5 114.5],[0 1.2],'k--')
+  hold
+  axis([0 200 0 1.2]); xlabel('x (m)'); ylabel('H_{s,SS} (m)')
+subplot(224)
+  plot(stat(2,:),stat(9,:),'ko','MarkerFacecolor','m')
+  hold
+  plot([114.5 114.5],[0 0.5],'k--')
+  hold
+  axis([0 200 0 0.5]); xlabel('x (m)'); ylabel('H_{s,IG} (m)')
