@@ -1,0 +1,125 @@
+function R2_DUMBBELL_SUMMARY(csvPath)
+% R2_DUMBBELL_SUMMARY
+% Single-panel figure that summarizes R2 (relative to SWL) for all (H,C) pairs:
+% a "dumbbell" with S0 and S3 markers connected by a line.
+%
+% Defaults to results_runup/tables/PAPER_TABLE_R2_PEAKS.csv (peak-level CSV),
+% and computes R2 per (Scenario,H,C) from its R2_Threshold_m column.
+%
+% Output: results_runup/plots/FIG_R2_DUMBBELL_SUMMARY.png/.fig
+
+if nargin<1 || isempty(csvPath)
+    csvPath = fullfile('results_runup','tables','PAPER_TABLE_R2_PEAKS.csv');
+end
+if ~isfile(csvPath), error('CSV not found: %s', csvPath); end
+
+% --- load with header fallback ---
+try
+    T = readtable(csvPath,'VariableNamingRule','preserve');
+catch
+    T = readtable(csvPath);
+end
+
+Scenario = string(getcol(T, {'Scenario','scenario'}));
+H        = string(toStrCol(getcol(T, {'Water Level (cm)','WaterLevelcm','Water_Level_cm_','WaterLevel','H','h'})));
+C        = string(toStrCol(getcol(T, {'Wave Condition','WaveCondition','Wave_Condition','C','Condition','Cond'})));
+R2th     = double( getcol(T, {'R2_Threshold_m','R2Threshold_m','R2','R2_rel','R2_threshold'}) );
+
+ok = Scenario~="" & isfinite(R2th);
+Scenario=Scenario(ok); H=H(ok); C=C(ok); R2th=R2th(ok);
+
+% --- get one R2 per (Scenario,H,C)
+[grp,~,idx] = unique(table(Scenario,H,C),'rows','stable');
+R2_agg = accumarray(idx, R2th, [], @nanmean);
+G = grp; G.R2_rel = R2_agg;  % relative to SWL already
+
+% split S0/S3 and inner-join on (H,C)
+S0 = G(G.Scenario=="S0",:);
+S3 = G(G.Scenario=="S3",:);
+[Pairs, ia, ib] = innerjoin(S0(:,{'H','C','R2_rel'}), S3(:,{'H','C','R2_rel'}), ...
+    'Keys',{'H','C'}, 'RightVariables','R2_rel');
+Pairs.Properties.VariableNames(end-1:end) = {'S0_R2_rel','S3_R2_rel'};
+
+% order rows by H then numeric C
+Cnum = str2double(Pairs.C); Cnum(isnan(Cnum)) = inf;
+[~,ord] = sortrows([str2double(Pairs.H), Cnum]);
+Pairs = Pairs(ord,:);
+
+% compute delta
+Pairs.dR2 = Pairs.S3_R2_rel - Pairs.S0_R2_rel;
+Pairs.pct = 100*Pairs.dR2 ./ Pairs.S0_R2_rel;
+
+% --- plot
+outdir = fullfile('results_runup','plots');
+if ~exist(outdir,'dir'), mkdir(outdir); end
+
+f = figure('Visible','off','Position',[200 200 1200 650]); hold on; grid on
+y = 1:height(Pairs);
+% connect line
+for i=1:height(Pairs)
+    plot([Pairs.S0_R2_rel(i), Pairs.S3_R2_rel(i)], [y(i), y(i)], '-', 'Color',[0.78 0.78 0.78], 'LineWidth',2);
+end
+% markers (consistent colors)
+colS0 = [0.10 0.35 0.85];  % blue
+colS3 = [0.85 0.20 0.20];  % red
+scatter(Pairs.S0_R2_rel, y, 55, 'filled', 'MarkerFaceColor',colS0, 'MarkerEdgeColor','k', 'DisplayName','S0 (no reef)');
+scatter(Pairs.S3_R2_rel, y, 55, 's',      'filled', 'MarkerFaceColor',colS3, 'MarkerEdgeColor','k', 'DisplayName','S3 (reef)');
+
+% annotate Δ (compact)
+rngX = range([Pairs.S0_R2_rel; Pairs.S3_R2_rel]); if rngX==0, rngX=1; end
+for i=1:height(Pairs)
+    txt = sprintf('Δ=%.03f m (%.0f%%)', Pairs.dR2(i), Pairs.pct(i));
+    xref = max(Pairs.S0_R2_rel(i), Pairs.S3_R2_rel(i)) + 0.02*rngX;
+    text(xref, y(i), txt, 'FontSize',9);
+end
+
+yticks(y);
+ylabs = strcat("H", Pairs.H, "  C", Pairs.C);
+yticklabels(ylabs);
+xlabel('R2% run-up (relative to SWL) (m)');
+ylabel('Water level & condition');
+legend('Location','best');
+
+% tidy x-limits
+minX = min([Pairs.S0_R2_rel; Pairs.S3_R2_rel]); maxX = max([Pairs.S0_R2_rel; Pairs.S3_R2_rel]);
+pad = 0.05*(maxX-minX + eps);
+xlim([minX-pad, maxX+pad]);
+
+saveas(f, fullfile(outdir,'FIG_R2_DUMBBELL_SUMMARY.png'));
+savefig(f, fullfile(outdir,'FIG_R2_DUMBBELL_SUMMARY.fig'));
+close(f);
+fprintf('Saved: %s\n', fullfile(outdir,'FIG_R2_DUMBBELL_SUMMARY.*'));
+
+end % main
+
+% -------- helpers --------
+function col = getcol(T, names)
+vn = string(T.Properties.VariableNames);
+col = [];
+for i=1:numel(names)
+    j = find(vn == string(names{i}), 1, 'first');
+    if ~isempty(j), col = T{:,j}; return; end
+end
+end
+
+function s = toStrCol(col)
+if iscell(col)
+    s = strings(numel(col),1);
+    for i=1:numel(col)
+        x = col{i};
+        if isstring(x), s(i) = x(1);
+        elseif ischar(x), s(i) = string(x);
+        elseif isnumeric(x), s(i) = string(num2str(x));
+        else, s(i) = "";
+        end
+    end
+elseif isstring(col)
+    s = col;
+elseif ischar(col)
+    s = string(col);
+elseif isnumeric(col)
+    s = string(col);
+else
+    s = string(col);
+end
+end
